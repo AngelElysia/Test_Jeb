@@ -1,0 +1,163 @@
+name: Cross-platform Build & Package (适配 UOS 10)
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch: # 手动触发构建
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [darwin, windows, linux]
+        arch: [amd64]
+    name: Build for ${{ matrix.os }}/${{ matrix.arch }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4 # 升级到最新版，更稳定
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # 与你项目的 Go 版本一致
+          cache: true # 缓存 Go 依赖，加速构建
+
+      - name: Install go-bindata (跨平台兼容)
+        run: |
+          go install github.com/go-bindata/go-bindata/v3/go-bindata@v3.2.0 # 锁定版本，避免兼容问题
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Generate bindata files (资源嵌入)
+        run: |
+          go-bindata -o internal/util/access.go -pkg util static/... templates/... cache/...
+
+      - name: Build binary (关键优化：适配 UOS 10)
+        run: |
+          APP_NAME=jetbra-free # 自定义程序名称（替换为你的项目名）
+          EXT=""
+          if [ "${{ matrix.os }}" = "windows" ]; then EXT=".exe"; fi
+          mkdir -p dist/${{ matrix.os }}-${{ matrix.arch }}
+
+          # 核心编译参数：禁用 CGO + 静态编译 + 兼容旧 GLIBC
+          # CGO_ENABLED=0：生成纯静态二进制，不依赖系统 GLIBC
+          # GOFLAGS=-buildmode=pie：生成位置无关可执行文件，UOS 更兼容
+          # -trimpath：移除编译路径，减小文件体积
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} CGO_ENABLED=0 GOFLAGS="-buildmode=pie" \
+          go build -mod=vendor -trimpath -ldflags "-w -s" \ # -w -s 移除调试信息，减小体积
+          -o dist/${{ matrix.os }}-${{ matrix.arch }}/$APP_NAME$EXT cmd/main.go
+
+          # 保留 Linux 原始二进制文件（UOS 10 可直接运行，无需安装）
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            cp dist/${{ matrix.os }}-${{ matrix.arch }}/$APP_NAME dist/$APP_NAME-linux-amd64
+          fi
+
+      # -------------------------- Linux 打包：DEB 格式（UOS 10 原生支持）--------------------------
+      - name: Install packaging tools for Linux (DEB)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev debhelper # UOS 原生支持 DEB，比 RPM 更兼容
+
+      - name: Package for Linux (DEB 包，适配 UOS 10)
+        if: matrix.os == 'linux'
+        run: |
+          APP_NAME=jetbra-free
+          VERSION=1.0.0
+          ARCH=amd64
+          DEB_DIR=dist/${APP_NAME}-${VERSION}-${ARCH}
+
+          # 创建 DEB 包目录结构（Debian 标准）
+          mkdir -p $DEB_DIR/DEBIAN
+          mkdir -p $DEB_DIR/usr/local/bin # 程序安装路径（UOS 常规路径）
+
+          # 复制二进制文件
+          cp dist/${{ matrix.os }}-${{ matrix.arch }}/$APP_NAME $DEB_DIR/usr/local/bin/
+          chmod 755 $DEB_DIR/usr/local/bin/$APP_NAME # 赋予执行权限
+
+          # 创建 DEB 控制文件（必须，UOS 安装时校验）
+          cat > $DEB_DIR/DEBIAN/control << EOF
+          Package: $APP_NAME
+          Version: $VERSION
+          Architecture: $ARCH
+          Maintainer: Elysia
+          Description: JetBrains 离线激活工具 # 程序描述
+          Depends: libc6 (>= 2.28) # 适配 UOS 10 的 GLIBC 2.28
+          Section: utils
+          Priority: optional
+          EOF
+
+          # 构建 DEB 包（dpkg-deb 是 Debian/UOS 原生工具）
+          dpkg-deb --build $DEB_DIR dist/$APP_NAME-${VERSION}-${ARCH}.deb
+
+      # -------------------------- macOS 打包：保留原逻辑，适配 macOS --------------------------
+      - name: Install packaging tools for macOS (DMG)
+        if: matrix.os == 'darwin'
+        run: |
+          npm install -g create-dmg || true
+          sudo apt-get update
+          sudo apt-get install -y genisoimage
+
+      - name: Package for macOS (DMG)
+        if: matrix.os == 'darwin'
+        run: |
+          APP_NAME=jetbra-free
+          mkdir -p $APP_NAME.app/Contents/MacOS
+          mkdir -p $APP_NAME.app/Contents/Resources
+
+          cp dist/${{ matrix.os }}-${{ matrix.arch }}/$APP_NAME $APP_NAME.app/Contents/MacOS/
+          chmod +x $APP_NAME.app/Contents/MacOS/$APP_NAME
+
+          cat > $APP_NAME.app/Contents/Info.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>$APP_NAME</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.example.$APP_NAME</string>
+              <key>CFBundleName</key>
+              <string>$APP_NAME</string>
+              <key>CFBundleVersion</key>
+              <string>1.0.0</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+          </dict>
+          </plist>
+          EOF
+
+          mkdir -p dmg-contents
+          cp -r $APP_NAME.app dmg-contents/
+          genisoimage -V "$APP_NAME" -D -R -apple -no-pad -o dist/$APP_NAME-macos-amd64.dmg dmg-contents/
+
+      # -------------------------- Windows 打包：保留原逻辑 --------------------------
+      - name: Rename Windows executable
+        if: matrix.os == 'windows'
+        run: |
+          APP_NAME=jetbra-free
+          cp dist/${{ matrix.os }}-${{ matrix.arch }}/$APP_NAME.exe dist/$APP_NAME-windows-amd64.exe
+
+      # -------------------------- 上传构建产物（UOS 10 重点下载 DEB 和 Linux 二进制）--------------------------
+      - name: Upload Linux artifacts (UOS 10 专用)
+        if: matrix.os == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}-uos
+          path:
+            dist/${{ env.APP_NAME }}-linux-amd64 # 直接运行的二进制文件
+            dist/${{ env.APP_NAME }}-*.deb # DEB 安装包（UOS 10 双击/命令安装）
+
+      - name: Upload macOS DMG
+        if: matrix.os == 'darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}-dmg
+          path: dist/*.dmg
+
+      - name: Upload Windows EXE
+        if: matrix.os == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}-exe
+          path: dist/*.exe

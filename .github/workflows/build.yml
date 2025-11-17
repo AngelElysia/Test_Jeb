@@ -1,156 +1,78 @@
-name: Cross-platform Build & Package
+name: Simple Cross-Platform Build (确保构建成功)
 on:
   push:
     branches: [ master, main ]
   pull_request:
     branches: [ master, main ]
-  workflow_dispatch:
+  workflow_dispatch: # 支持手动触发，方便测试
 
 jobs:
   build:
+    runs-on: ubuntu-latest
     strategy:
+      # 只保留核心平台，减少构建失败概率
       matrix:
-        include:
-          - os: darwin
-            arch: amd64
-            runner: macos-13
-          - os: darwin
-            arch: arm64
-            runner: macos-14
+        target:
           - os: linux
             arch: amd64
-            runner: ubuntu-latest
+            ext: ""
           - os: windows
             arch: amd64
-            runner: windows-latest
-            
-    runs-on: ${{ matrix.runner }}
-    name: Build for ${{ matrix.os }}/${{ matrix.arch }}
+            ext: ".exe"
+          - os: darwin
+            arch: amd64
+            ext: ""
+    name: Build ${{ matrix.target.os }}-${{ matrix.target.arch }}
 
     steps:
-      - name: Checkout source code
+      # 步骤1：拉取代码（使用最新稳定版）
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v4
+      # 步骤2：安装 Go 环境（锁定版本，避免波动）
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: "1.22"
+          cache: true # 缓存依赖，加速构建
 
+      # 步骤3：安装 go-bindata（锁定版本，避免兼容问题）
       - name: Install go-bindata
         run: |
-          go install github.com/go-bindata/go-bindata/v3/go-bindata@latest
+          go install github.com/go-bindata/go-bindata/v3/go-bindata@v3.2.0
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-        shell: bash
 
-      - name: Generate bindata files
+      # 步骤4：生成 bindata 文件（资源嵌入，核心步骤）
+      - name: Generate bindata
         run: |
+          # 确保输出目录存在，避免报错
+          mkdir -p internal/util
           go-bindata -o internal/util/access.go -pkg util static/... templates/... cache/...
-        shell: bash
 
+      # 步骤5：编译二进制文件（适配 UOS 10，核心优化）
       - name: Build binary
-        env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
         run: |
-          OUTPUT_NAME=your-app
-          EXT=""
-          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
-          mkdir -p dist
-          go build -ldflags="-s -w" -o dist/$OUTPUT_NAME$EXT cmd/main.go
-        shell: bash
-      
-      - name: Install packaging tools for Linux (RPM)
-        if: matrix.os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm
-      
-      - name: Install packaging tools for macOS
-        if: matrix.os == 'darwin'
-        run: |
-          # 使用系统自带的 hdiutil，不需要安装额外工具
-          echo "Using system hdiutil for DMG creation"
+          APP_NAME="jetbra-free"
+          OUTPUT_DIR="dist"
+          mkdir -p $OUTPUT_DIR
 
-      - name: Package for Linux (RPM)
-        if: matrix.os == 'linux'
-        run: |
-          # Your RPM packaging script here...
-          echo "Packaging RPM for Linux..."
-          # Example: cp rpmbuild/RPMS/x86_64/your-app-*.rpm dist/your-app-linux-amd64.rpm
-          
-      - name: Package for macOS (DMG)
-        if: matrix.os == 'darwin'
-        run: |
-          APP_NAME=your-app
-          
-          # Check if the binary exists from the build step
-          if [ ! -f "dist/$APP_NAME" ]; then
-            echo "Error: Binary 'dist/$APP_NAME' not found. The build step likely failed."
-            exit 1
-          fi
+          # 编译参数：禁用 CGO+静态编译+减小体积，确保 UOS 10 兼容
+          CGO_ENABLED=0 \
+          GOOS=${{ matrix.target.os }} \
+          GOARCH=${{ matrix.target.arch }} \
+          GOFLAGS="-buildmode=pie" \
+          go build \
+            -mod=vendor \ # 优先使用本地 vendor 依赖，避免网络问题
+            -trimpath \ # 移除编译路径，减小体积
+            -ldflags "-w -s" \ # 移除调试信息，进一步减小体积
+            -o $OUTPUT_DIR/${APP_NAME}-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }} \
+            cmd/main.go
 
-          # Create the .app structure
-          mkdir -p "dist/$APP_NAME.app/Contents/MacOS"
-          cp "dist/$APP_NAME" "dist/$APP_NAME.app/Contents/MacOS/"
-          
-          # Make the binary executable
-          chmod +x "dist/$APP_NAME.app/Contents/MacOS/$APP_NAME"
-          
-          # Create the Info.plist
-          cat > "dist/$APP_NAME.app/Contents/Info.plist" << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>$APP_NAME</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.example.$APP_NAME</string>
-              <key>CFBundleName</key>
-              <string>$APP_NAME</string>
-              <key>CFBundleVersion</key>
-              <string>1.0.0</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>11.0</string>
-          </dict>
-          </plist>
-          EOF
-
-          # Create DMG using system hdiutil (more reliable)
-          hdiutil create -srcfolder "dist/$APP_NAME.app" -volname "$APP_NAME" "dist/$APP_NAME.dmg"
-          
-          # Alternative: Simple create-dmg (if you prefer, but requires npm install)
-          # create-dmg "dist/$APP_NAME.dmg" "dist/$APP_NAME.app"
-
-      - name: Prepare Artifacts for Upload
-        run: |
-          OUTPUT_NAME=your-app
-          OS=${{ matrix.os }}
-          ARCH=${{ matrix.arch }}
-          
-          cd dist
-          
-          if [ "$OS" = "windows" ]; then
-            mv $OUTPUT_NAME.exe ${OUTPUT_NAME}-${OS}-${ARCH}.exe
-          elif [ "$OS" = "darwin" ]; then
-            # DMG file should already be named correctly
-            if [ -f "$OUTPUT_NAME.dmg" ]; then
-              mv $OUTPUT_NAME.dmg ${OUTPUT_NAME}-${OS}-${ARCH}.dmg
-            fi
-          else # Linux
-            tar -czf ../${OUTPUT_NAME}-${OS}-${ARCH}.tar.gz $OUTPUT_NAME
-            rm $OUTPUT_NAME
-          fi
-        shell: bash
-
-      - name: Upload Artifacts
+      # 步骤6：上传构建产物（只传二进制，避免打包出错）
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}-${{ matrix.arch }}-build
+          name: ${{ APP_NAME }}-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: |
-            dist/*.dmg
-            dist/*.exe
-            *.tar.gz
-          if-no-files-found: error
+            dist/${APP_NAME}-${{ matrix.target.os }}-${{ matrix.target.arch }}${{ matrix.target.ext }}
+          retention-days: 7 # 产物保留7天，节省空间

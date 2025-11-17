@@ -146,7 +146,6 @@ jobs:
           name: ${{ matrix.os }}-${{ matrix.arch }}-uos
           path:
             dist/${{ env.APP_NAME }}-linux-amd64 # 直接运行的二进制文件
-            dist/${{ env.APP_NAME }}-*.deb # DEB 安装包（UOS 10 双击/命令安装）
 
       - name: Upload macOS DMG
         if: matrix.os == 'darwin'
